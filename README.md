@@ -89,10 +89,10 @@ How it runs:
 - Secrets arrive as systemd credentials.
 - The remote host keys must be in `sshKnownHostsFile` (`/etc/ssh/ssh_known_hosts` by default); they are checked strictly.
 
-`wett-mcp-ctl` runs admin commands as the service user:
+`wett-mcp-ctl` runs admin commands as the service user. It starts a transient unit, so it needs root:
 
-- `wett-mcp-ctl revoke-all` is the kill switch.
-- `wett-mcp-ctl mint-token [--write]` issues a token for local testing.
+- `sudo wett-mcp-ctl revoke-all` is the kill switch.
+- `sudo wett-mcp-ctl mint-token [--write]` issues a token for local testing.
 
 The module does not publish anything. Point a Cloudflare Tunnel ingress at the listen address, for example with nixpkgs
 `services.cloudflared`:
@@ -125,7 +125,7 @@ services.cloudflared.tunnels."<tunnel-uuid>" = {
    - Approve in the Access login and consent page.
    - In the connector's tool settings, set the write tools to require approval.
 
-Before exposing anything, test from the tailnet or LAN with `wett-mcp-ctl mint-token` and any MCP client. Claude Code
+Before exposing anything, test from the tailnet or LAN with `sudo wett-mcp-ctl mint-token` and any MCP client. Claude Code
 works too: its loopback redirect matches on any port.
 
 ## Development
