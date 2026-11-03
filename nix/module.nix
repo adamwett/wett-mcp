@@ -64,12 +64,33 @@ let
         ;
       tokenFile = toString hcfg.ha.tokenFile;
     };
+  }
+  // lib.optionalAttrs hcfg.agents.enable {
+    agents = {
+      inherit (hcfg.agents)
+        workRoot
+        stateDir
+        cloneOwners
+        maxConcurrent
+        defaultMinutes
+        maxMinutes
+        maxPromptChars
+        ompArgs
+        ;
+      omp = hcfg.agents.ompCommand;
+      gh = hcfg.agents.ghCommand;
+      envFiles = lib.mapAttrs (_: toString) hcfg.agents.envFiles;
+    }
+    // lib.optionalAttrs (hcfg.agents.systemNote != null) { inherit (hcfg.agents) systemNote; };
   };
   hostdConfigFile = pkgs.writeText "wett-mcp-hostd.json" (builtins.toJSON hostdSettings);
 
   # Secrets reach the service as systemd credentials; the JSON names them.
   credentials =
     lib.optional (cfg.sshKeyFile != null) "ssh-key:${toString cfg.sshKeyFile}"
+    ++ lib.mapAttrsToList (name: h: "ssh-key-${name}:${toString h.keyFile}") (
+      lib.filterAttrs (_: h: h.keyFile != null) cfg.hosts
+    )
     ++ lib.optional (cfg.notify != null) "notify-token:${toString cfg.notify.tokenFile}"
     ++ lib.concatMap (
       name:
@@ -82,13 +103,16 @@ let
   serverSettings = {
     inherit (cfg)
       publicUrl
-      hosts
       haHost
+      agentsHost
       accessTokenTtl
       refreshTokenTtl
       sshKnownHostsFile
       authFailureAlert
       ;
+    hosts = lib.mapAttrs (
+      name: h: { inherit (h) ssh; } // lib.optionalAttrs (h.keyFile != null) { keyFile = "ssh-key-${name}"; }
+    ) cfg.hosts;
     listen = { inherit (cfg.listen) host port; };
     stateDir = "/var/lib/wett-mcp";
     access = { inherit (cfg.access) teamDomain aud allowEmails; };
@@ -107,7 +131,8 @@ let
     media = lib.mapAttrs (name: m: m // lib.optionalAttrs (m ? keyFile) { keyFile = "${name}-key"; }) (
       lib.filterAttrs (_: m: m != null) cfg.media
     );
-    localHostd = hostdSettings;
+    # Agents never run in-process: they belong to a host whose hostd runs as the agents' user.
+    localHostd = removeAttrs hostdSettings [ "agents" ];
   };
   configFile = pkgs.writeText "wett-mcp.json" (builtins.toJSON serverSettings);
 
@@ -201,6 +226,11 @@ in
             example = "wett-mcp-hostd@otherhost";
             description = "SSH destination of the host's hostd; null means this machine (in-process).";
           };
+          options.keyFile = mkOption {
+            type = secretFile;
+            default = null;
+            description = "Private key for this host only (falls back to `sshKeyFile`).";
+          };
         }
       );
       default = { };
@@ -223,6 +253,15 @@ in
       type = types.nullOr types.str;
       default = null;
       description = "Name (in `hosts`) of the host whose hostd holds the Home Assistant token.";
+    };
+
+    agentsHost = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      description = ''
+        Name (in `hosts`) of the host whose hostd has `agents` enabled. Turns on the agent_* tools;
+        dispatch, send and stop need the `lab.agents` scope.
+      '';
     };
 
     prometheus = mkOption {
@@ -332,6 +371,15 @@ in
         description = "User the connector logs in as; its only command is hostd.";
       };
 
+      createUser = mkOption {
+        type = types.bool;
+        default = true;
+        description = ''
+          Create `user` as a dedicated system user. Set false to add the forced-command keys to an
+          existing user instead, e.g. the agents' own user for `agents`.
+        '';
+      };
+
       authorizedKeys = mkOption {
         type = types.listOf types.str;
         default = [ ];
@@ -404,6 +452,85 @@ in
         default = null;
         description = "Home Assistant access through this host's hostd.";
       };
+
+      agents = {
+        enable = mkEnableOption ''
+          the agent_* verbs: headless oh-my-pi (omp) coding agents run as `user` in transient
+          `systemd-run --user` units. `user` needs a lingering systemd user manager, omp and gh on PATH,
+          and is trusted with whatever credentials it holds
+        '';
+        workRoot = mkOption {
+          type = types.str;
+          default = "~/work";
+          description = "Directory whose immediate subdirectories are the repos agents may work in.";
+        };
+        stateDir = mkOption {
+          type = types.str;
+          default = "~/.local/state/wett-agents";
+          description = "Job state: meta, queued messages, per-turn results, raw events, omp sessions.";
+        };
+        cloneOwners = mkOption {
+          type = types.listOf types.str;
+          default = [ ];
+          example = [ "octocat" ];
+          description = "GitHub owners whose repos agent_dispatch may clone (`owner/name`) into workRoot.";
+        };
+        maxConcurrent = mkOption {
+          type = types.ints.positive;
+          default = 3;
+          description = "Running agent units allowed at once.";
+        };
+        defaultMinutes = mkOption {
+          type = types.ints.positive;
+          default = 60;
+          description = "Run time budget when the dispatch names none.";
+        };
+        maxMinutes = mkOption {
+          type = types.ints.positive;
+          default = 240;
+          description = "Cap on a run's time budget.";
+        };
+        maxPromptChars = mkOption {
+          type = types.ints.positive;
+          default = 20000;
+          description = "Longest prompt or follow-up message accepted.";
+        };
+        ompCommand = mkOption {
+          type = types.str;
+          default = "omp";
+          description = "omp executable (looked up on PATH unless absolute).";
+        };
+        ghCommand = mkOption {
+          type = types.str;
+          default = "gh";
+          description = "gh executable, for cloning.";
+        };
+        ompArgs = mkOption {
+          type = types.listOf types.str;
+          default = [ ];
+          example = [
+            "--approval-mode"
+            "yolo"
+          ];
+          description = "Fixed extra omp arguments for every turn.";
+        };
+        envFiles = mkOption {
+          type = types.attrsOf (types.either types.path types.str);
+          default = { };
+          example = {
+            GH_TOKEN = "/run/secrets/github-token";
+          };
+          description = ''
+            Environment variables read from files at each turn (and for cloning). The transient units
+            don't inherit a login shell's environment.
+          '';
+        };
+        systemNote = mkOption {
+          type = types.nullOr types.str;
+          default = null;
+          description = "Replaces the built-in note appended to every agent's system prompt.";
+        };
+      };
     };
   };
 
@@ -415,8 +542,13 @@ in
           message = "services.wettMcp.haHost must name an entry of services.wettMcp.hosts.";
         }
         {
-          assertion = lib.all (h: h.ssh == null) (lib.attrValues cfg.hosts) || cfg.sshKeyFile != null;
-          message = "services.wettMcp.sshKeyFile is required when a host is reached over SSH.";
+          assertion = cfg.agentsHost == null || cfg.hosts ? ${cfg.agentsHost};
+          message = "services.wettMcp.agentsHost must name an entry of services.wettMcp.hosts.";
+        }
+        {
+          assertion = lib.all (h: h.ssh == null || h.keyFile != null) (lib.attrValues cfg.hosts)
+            || cfg.sshKeyFile != null;
+          message = "services.wettMcp.sshKeyFile (or the host's keyFile) is required when a host is reached over SSH.";
         }
       ];
 
@@ -475,17 +607,19 @@ in
     })
 
     (lib.mkIf hcfg.enable {
-      users.groups.${hcfg.user} = { };
       users.users.${hcfg.user} = {
+        openssh.authorizedKeys.keys = map (
+          key: ''command="${hcfg.package}/bin/wett-mcp-hostd ${hostdConfigFile}",restrict ${key}''
+        ) hcfg.authorizedKeys;
+      }
+      // lib.optionalAttrs hcfg.createUser {
         isSystemUser = true;
         group = hcfg.user;
         extraGroups = [ "systemd-journal" ];
         # sshd runs the forced command through the login shell.
         shell = pkgs.bash;
-        openssh.authorizedKeys.keys = map (
-          key: ''command="${hcfg.package}/bin/wett-mcp-hostd ${hostdConfigFile}",restrict ${key}''
-        ) hcfg.authorizedKeys;
       };
+      users.groups = lib.mkIf hcfg.createUser { ${hcfg.user} = { }; };
     })
   ];
 }

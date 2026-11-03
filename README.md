@@ -19,7 +19,10 @@ It is meant to sit behind a Cloudflare Tunnel.
     `aud`, `iss`, `exp` and the email allowlist.
   - Without a valid JWT it answers 403 and never redirects, so a missing or misconfigured Access app fails closed.
   - The consent page is HMAC-protected against tampering and cannot be framed.
-  - The **write tools** checkbox decides whether the grant gets `lab.write`.
+  - The **write tools** checkbox decides whether the grant gets `lab.write`; a separate **coding agents** checkbox
+    grants `lab.agents`. Neither is ticked by default. A grant without a scope gets a tool error naming it; to add
+    one, disconnect and reconnect the connector (the SDK checks scopes per endpoint, so there is no per-tool 403
+    step-up challenge).
 - **No shell.** Host access goes through `wett-mcp-hostd`, a stdlib-only program of fixed verbs. It runs in-process
   for the local host, or as an SSH forced command (`command=…,restrict`) on other hosts.
 
@@ -35,9 +38,38 @@ It is meant to sit behind a Cloudflare Tunnel.
 | `media_status` | read | Sonarr/Radarr queue and 7-day calendar, SABnzbd and qBittorrent queues, recent Jellyfin items. |
 | `lab_notify` | write | Phone notification through a bearer-token relay. Rate limited. |
 | `ha_call_service` | write | Allowlisted `domain.service` + entity globs, which must name entities explicitly. The built-in deny list always wins: locks, alarms, covers, valves, sirens, cameras, HA/OS administration, command/notify/MQTT services and others. Every call is mirrored as a notification. |
+| `agent_list` | read | Coding-agent jobs: id, title, repo, state (`running`, `idle`, `stopped`, `failed`), start, last activity, turns, queued messages, cost. |
+| `agent_read(id, since_turn?)` | read | Per finished turn: prompt, status (`ok`, `timed_out`, `failed`, `stopped`) and the agent's final message (redacted, ≤8000 chars), plus state, queued messages and an `omp --resume` command for taking the session over by hand. |
+| `agent_dispatch(repo, prompt, title?, max_minutes?)` | agents | Start a headless oh-my-pi (`omp`) coding agent. `repo` is a directory name in the work root, or `owner/name` from an allowlisted GitHub owner (cloned with `gh` if missing). |
+| `agent_send(id, message)` | agents | Follow-up: queued as the next turn while the agent runs; otherwise starts a run that resumes the session. |
+| `agent_stop(id)` | agents | Stop the current run and drop queued messages; the session stays resumable. |
 
 Every call is appended to `/var/lib/wett-mcp/audit.jsonl` with secrets redacted. More than 20 401s in 5 minutes
 triggers one notification.
+
+### Coding agents
+
+Set `agentsHost` to a host whose hostd has `hostd.agents.enable`, running as the agents' own user
+(`hostd.user = "agent"; hostd.createUser = false;`). That user needs a lingering systemd user manager, `omp` and
+`gh`, and whatever credentials the agents should have (pass them with `hostd.agents.envFiles`).
+
+- **Runs.** A dispatch puts the prompt in the job's inbox and starts a transient `systemd-run --user` unit
+  (`wett-agent-<id>-<run>`). The unit runs hostd's runner, which drains the inbox: one headless
+  `omp -p --mode json --session-dir <job>/session [--resume <session>] -- <message>` per message, then exits.
+  The message always follows `--`, so it can't be read as a flag or an `@file`.
+- **State** lives in `~/.local/state/wett-agents/<id>/`: `meta.json` (state, inbox, session id), `turns.jsonl`
+  (status and final text per turn), raw `events/<turn>.jsonl`, and the omp session.
+- **Limits.** `maxConcurrent` running units (default 3), a per-run time budget (`defaultMinutes` 60, capped at
+  `maxMinutes` 240, passed to `omp --max-time` and backed by the unit's `RuntimeMaxSec`), `maxPromptChars` (20000),
+  20 queued messages per job.
+- **Validation.** The server checks arguments, and hostd checks them again: repo names can't contain `/` (beyond
+  one `owner/` prefix), can't start with `-` or `.`, and must resolve to a direct child of the work root. Job ids
+  are 8 hex chars.
+- **Guardrails.** Every dispatch, send and stop is pushed to the phone (`<titlePrefix> → agent`, outside
+  `lab_notify`'s rate limit). Dispatch and send are refused if that push fails. Every agent's system prompt gets
+  a note (`hostd.agents.systemNote`) saying it was dispatched remotely, must not push default branches unless
+  told to, and must end each turn with a summary, which is what `agent_read` returns.
+- **Annotations.** The agents tools are `destructiveHint`; set dispatch and send to *always ask* in Claude.
 
 ## NixOS
 
@@ -59,7 +91,9 @@ services.wettMcp = {
   };
   hosts.server = { };                                   # this machine, in-process
   hosts.other.ssh = "wett-mcp-hostd@other.example.lan"; # remote hostd
+  hosts.agents = { ssh = "agent@agents.example.lan"; keyFile = "/run/secrets/agents-key"; };
   sshKeyFile = "/run/secrets/wett-mcp-ssh-key";
+  agentsHost = "agents";
   haHost = "other";
   prometheus.url = "http://127.0.0.1:9090";
   notify = { url = "http://relay.example.lan/notify"; tokenFile = "/run/secrets/notify-token"; };
@@ -81,6 +115,19 @@ services.wettMcp.hostd = {
     ];
   };
 };
+
+# on the agents host (its own key; hostd runs as the agents' user)
+services.wettMcp.hostd = {
+  enable = true;
+  user = "agent";
+  createUser = false;
+  authorizedKeys = [ "ssh-ed25519 AAAA… wett-mcp-agents" ];
+  agents = {
+    enable = true;
+    cloneOwners = [ "my-github-user" ];
+    envFiles.GH_TOKEN = "/run/secrets/github-token";
+  };
+};
 ```
 
 How it runs:
@@ -92,7 +139,7 @@ How it runs:
 `wett-mcp-ctl` runs admin commands as the service user. It starts a transient unit, so it needs root:
 
 - `sudo wett-mcp-ctl revoke-all` is the kill switch.
-- `sudo wett-mcp-ctl mint-token [--write]` issues a token for local testing.
+- `sudo wett-mcp-ctl mint-token [--write] [--agents]` issues a token for local testing.
 
 The module does not publish anything. Point a Cloudflare Tunnel ingress at the listen address, for example with nixpkgs
 `services.cloudflared`:
@@ -143,5 +190,8 @@ The tests run a real OAuth flow end to end:
 - Access JWTs that are valid, forged, expired, for the wrong audience or for the wrong email.
 - PKCE.
 - Refresh rotation, and revocation on reuse or code replay.
-- Scope enforcement on write tools, through a real MCP client.
+- Scope enforcement on write and agent tools, through a real MCP client.
 - Hostd's verb, unit, `since` and Home Assistant policy checks.
+- The agent verbs against a fake `omp` on `PATH`: repo/id/argument validation (`..`, absolute paths, symlink
+  escapes, owners outside the allowlist, flag-like repos and prompts), the concurrency cap, the inbox → resume
+  loop, stop, timed-out and failed turns, and a runner killed without recording anything.

@@ -25,10 +25,12 @@ from mcp.types import ToolAnnotations
 from starlette.routing import Route
 
 from . import hostd
-from .oauth import SCOPE_READ, SCOPE_WRITE, AccessVerifier, AuthServer, Store, Verifier
+from .oauth import SCOPE_AGENTS, SCOPE_READ, SCOPE_WRITE, AccessVerifier, AuthServer, Store, Verifier
 
 READ = ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False)
 WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False)
+# Agents run code that reaches the internet and can push to GitHub.
+AGENT = ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=True)
 MAX_RESULT_CHARS = 60_000
 PROM_MAX_RANGE_MIN = 7 * 24 * 60
 PROM_MAX_POINTS = 1000
@@ -100,7 +102,7 @@ class Lab:
         if spec is None:
             raise ToolError(f"unknown host {host!r}; known: {sorted(self.hosts)}")
         if spec.get("ssh"):
-            argv = ["ssh", "-F", "/dev/null", "-i", self._ssh_key_path(), "-o", "BatchMode=yes",
+            argv = ["ssh", "-F", "/dev/null", "-i", self._ssh_key_path(spec.get("keyFile")), "-o", "BatchMode=yes",
                     "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=yes",
                     "-o", f"GlobalKnownHostsFile={self.cfg.get('sshKnownHostsFile', '/etc/ssh/ssh_known_hosts')}",
                     "-o", "UserKnownHostsFile=/dev/null", "-o", "ConnectTimeout=10",
@@ -116,8 +118,9 @@ class Lab:
             raise ToolError(f"{host}: {reply.get('error')}")
         return reply["result"]
 
-    def _ssh_key_path(self) -> str:
-        name = self.cfg["sshKeyFile"]
+    def _ssh_key_path(self, name: str | None = None) -> str:
+        """The host's own key if it has one, else the shared sshKeyFile."""
+        name = name or self.cfg["sshKeyFile"]
         if os.path.isabs(name):
             return name
         return str(Path(os.environ.get("CREDENTIALS_DIRECTORY", ".")) / name)
@@ -133,17 +136,23 @@ class Lab:
             raise ToolError(f"prometheus: {body.get('error', resp.status_code)}")
         return body["data"]
 
-    async def notify(self, message: str, title: str | None = None) -> None:
+    async def notify(self, message: str, title: str | None = None, guardrail: bool = False) -> None:
+        """Push to the owner's phone. guardrail=True (agent alerts) skips lab_notify's rate limit and is
+        titled `<prefix> → <title>`, so it can't be mistaken for a lab_notify message."""
         n = self.cfg.get("notify")
         if not n:
             raise ToolError("notifications are not configured")
         now = time.time()
-        self._notify_times = [t for t in self._notify_times if t > now - 3600]
-        if len(self._notify_times) >= n.get("maxPerHour", 10):
-            raise ToolError("notification rate limit reached; try later")
-        self._notify_times.append(now)
+        if not guardrail:
+            self._notify_times = [t for t in self._notify_times if t > now - 3600]
+            if len(self._notify_times) >= n.get("maxPerHour", 10):
+                raise ToolError("notification rate limit reached; try later")
+            self._notify_times.append(now)
         prefix = n.get("titlePrefix", "Claude")
-        full_title = f"{prefix}: {title}" if title else prefix
+        if guardrail:
+            full_title = f"{prefix} → {title}"
+        else:
+            full_title = f"{prefix}: {title}" if title else prefix
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.post(n["url"], json={"message": message[:1000], "title": full_title[:100]},
                                      headers={"Authorization": f"Bearer {secret(self.cfg, n['tokenFile'])}"})
@@ -169,7 +178,9 @@ def build_mcp(cfg: dict, lab: Lab, auth: AuthServer) -> FastMCP:
     mcp = FastMCP(
         "wett-mcp",
         instructions="Read-mostly access to a homelab: host and service health, logs, metrics, "
-                     "Home Assistant, media queues, and phone notifications. Write tools need lab.write.",
+                     "Home Assistant, media queues, and phone notifications. Write tools need lab.write. "
+                     "agent_* tools dispatch and talk to headless coding agents (dispatch/send/stop need "
+                     "lab.agents); each turn ends with the agent's summary, which agent_read returns.",
         token_verifier=Verifier(auth),
         auth=AuthSettings(issuer_url=cfg["publicUrl"], resource_server_url=cfg["publicUrl"].rstrip("/") + "/mcp",
                           required_scopes=[SCOPE_READ]),
@@ -182,7 +193,7 @@ def build_mcp(cfg: dict, lab: Lab, auth: AuthServer) -> FastMCP:
         ),
     )
 
-    def tool(annotations: ToolAnnotations, write: bool = False):
+    def tool(annotations: ToolAnnotations, scope: str = SCOPE_READ):
         """Register a tool with scope check, audit and output clipping."""
 
         def deco(fn):
@@ -191,10 +202,13 @@ def build_mcp(cfg: dict, lab: Lab, auth: AuthServer) -> FastMCP:
                 scopes = token.scopes if token else []
                 entry = {"tool": fn.__name__, "args": kwargs, "client": getattr(token, "client_id", None),
                          "family": getattr(token, "family", None)}
-                if write and SCOPE_WRITE not in scopes:
-                    lab.audit.write(**entry, ok=False, error="missing lab.write")
-                    raise ToolError(f"{fn.__name__} requires the {SCOPE_WRITE} scope; reconnect and "
-                                    "approve write tools")
+                if scope not in scopes:
+                    # The SDK checks scopes per endpoint, not per tool, so this can't be a 403
+                    # insufficient_scope challenge; the message says how to step up instead.
+                    lab.audit.write(**entry, ok=False, error=f"missing {scope}")
+                    raise ToolError(f"{fn.__name__} requires the {scope} scope, which this connection was not "
+                                    "granted. Disconnect and reconnect the connector, then tick the matching "
+                                    "box on the consent page.")
                 try:
                     result = _clip(await fn(**kwargs))
                 except ToolError as e:
@@ -300,13 +314,13 @@ def build_mcp(cfg: dict, lab: Lab, auth: AuthServer) -> FastMCP:
         and movies for the next 7 days, and recently added Jellyfin items."""
         return await media(cfg, lab)
 
-    @tool(WRITE, write=True)
+    @tool(WRITE, scope=SCOPE_WRITE)
     async def lab_notify(message: str, title: str | None = None) -> dict:
         """Push a notification to the lab owner's phone. Rate limited."""
         await lab.notify(message, title)
         return {"sent": True}
 
-    @tool(WRITE, write=True)
+    @tool(WRITE, scope=SCOPE_WRITE)
     async def ha_call_service(domain: str, service: str, entity_id: list[str],
                               data: dict | None = None) -> dict:
         """Call a Home Assistant service on named entities, e.g. light.turn_on with
@@ -322,6 +336,70 @@ def build_mcp(cfg: dict, lab: Lab, auth: AuthServer) -> FastMCP:
             except ToolError:
                 pass
         return result
+
+    agents_host = cfg.get("agentsHost")
+    if agents_host:
+        async def alert(text: str) -> None:
+            """Guardrail push for every agent action; fails closed for dispatch/send."""
+            if not cfg.get("notify"):
+                return
+            try:
+                await lab.notify(text, "agent", guardrail=True)
+            except (ToolError, httpx.HTTPError) as e:
+                raise ToolError(f"refused: the phone notification for this agent action failed ({e})") from None
+
+        @tool(AGENT, scope=SCOPE_AGENTS)
+        async def agent_dispatch(repo: str, prompt: str, title: str | None = None,
+                                 max_minutes: int | None = None) -> dict:
+            """Start a headless coding agent (oh-my-pi) on the agents host. repo: a directory name in the
+            agents' work root, or a GitHub owner/name (cloned if missing; owners are allowlisted). prompt: the
+            task, self-contained (nobody answers questions mid-run). The agent works on a branch and opens a
+            PR; it never pushes default branches unless the prompt says so. max_minutes: run time budget
+            (default 60, capped by the host). Returns a job id; agent_read shows the agent's final summary.
+            Every dispatch is pushed to the owner's phone."""
+            hostd.check_repo(repo)
+            hostd.check_text(prompt, "prompt")
+            title = hostd.check_title(title)
+            if max_minutes is not None:
+                hostd.check_minutes(max_minutes, 1, max_minutes)
+            await alert(f"dispatch in {repo}: {prompt.strip()[:120]}")
+            return await lab.hostd(agents_host, {"verb": "agent_dispatch", "repo": repo, "prompt": prompt,
+                                                 "title": title, "max_minutes": max_minutes})
+
+        @tool(AGENT, scope=SCOPE_AGENTS)
+        async def agent_send(id: str, message: str) -> dict:
+            """Send a follow-up message to an agent job. Queued as its next turn if it is busy; if it is
+            idle, finished, failed or stopped, a new run resumes the same session with it."""
+            hostd.check_agent_id(id)
+            hostd.check_text(message, "message")
+            await alert(f"message to {id}: {message.strip()[:120]}")
+            return await lab.hostd(agents_host, {"verb": "agent_send", "id": id, "message": message})
+
+        @tool(ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False),
+              scope=SCOPE_AGENTS)
+        async def agent_stop(id: str) -> dict:
+            """Stop an agent job's current run and drop its queued messages. The session is kept:
+            agent_send resumes it later."""
+            hostd.check_agent_id(id)
+            result = await lab.hostd(agents_host, {"verb": "agent_stop", "id": id})
+            try:
+                await alert(f"stopped {id}")
+            except ToolError:
+                pass
+            return result
+
+        @tool(READ)
+        async def agent_list() -> dict:
+            """Agent jobs, newest first: id, title, repo, state (running, idle, stopped, failed), start and
+            last activity, turn count, queued messages, cost."""
+            return await lab.hostd(agents_host, {"verb": "agent_list"})
+
+        @tool(READ)
+        async def agent_read(id: str, since_turn: int = 0) -> dict:
+            """An agent job's state and, per finished turn after since_turn, the prompt and the agent's final
+            message (redacted, clipped), plus queued messages and how to resume the session by hand."""
+            hostd.check_agent_id(id)
+            return await lab.hostd(agents_host, {"verb": "agent_read", "id": id, "since_turn": since_turn})
 
     return mcp
 
@@ -430,6 +508,7 @@ def main(argv: list[str] | None = None) -> None:
     sub.add_parser("revoke-all", help="revoke every grant (kill switch)")
     mint = sub.add_parser("mint-token", help="issue a token directly (local testing; needs DB write access)")
     mint.add_argument("--write", action="store_true", help="include lab.write")
+    mint.add_argument("--agents", action="store_true", help="include lab.agents")
     mint.add_argument("--ttl", type=int, default=3600)
     args = parser.parse_args(argv)
     cfg = load_config(args.config)
@@ -445,7 +524,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.cmd == "revoke-all":
         print(f"revoked {store.revoke_all()} grant(s)")
     elif args.cmd == "mint-token":
-        scopes = [SCOPE_READ] + ([SCOPE_WRITE] if args.write else [])
+        scopes = [SCOPE_READ] + ([SCOPE_WRITE] if args.write else []) + ([SCOPE_AGENTS] if args.agents else [])
         resource = cfg["publicUrl"].rstrip("/") + "/mcp"
         family = store.new_family("cli", "cli", scopes, resource)
         access, _ = store.issue(family, args.ttl, args.ttl)

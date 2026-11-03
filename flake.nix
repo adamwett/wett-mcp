@@ -29,6 +29,7 @@
           nativeCheckInputs = [
             py.pytestCheckHook
             py.pytest-asyncio
+            pkgs.git # test_agents makes a repo to check clone-origin matching
           ];
           pythonImportsCheck = [ "wett_mcp.server" ];
           meta.mainProgram = "wett-mcp";
@@ -65,6 +66,11 @@
                   };
                   hosts.local = { };
                   hosts.remote.ssh = "wett-mcp-hostd@remote.example.test";
+                  hosts.box = {
+                    ssh = "agent@box.example.test";
+                    keyFile = "/run/secrets/example-box-key";
+                  };
+                  agentsHost = "box";
                   sshKeyFile = "/run/secrets/example-key";
                   haHost = "remote";
                   notify = {
@@ -85,6 +91,32 @@
             ];
           };
           svc = eval.config.systemd.services.wett-mcp.serviceConfig;
+          # The agents side: hostd's keys on an existing user, agent verbs enabled.
+          box = nixpkgs.lib.nixosSystem {
+            inherit system;
+            modules = [
+              self.nixosModules.default
+              {
+                system.stateVersion = "26.05";
+                users.users.agent = {
+                  isNormalUser = true;
+                  openssh.authorizedKeys.keys = [ "ssh-ed25519 AAAAhuman" ];
+                };
+                services.wettMcp.hostd = {
+                  enable = true;
+                  user = "agent";
+                  createUser = false;
+                  authorizedKeys = [ "ssh-ed25519 AAAAconnector" ];
+                  agents = {
+                    enable = true;
+                    cloneOwners = [ "octocat" ];
+                    envFiles.GH_TOKEN = "/run/gh-token";
+                  };
+                };
+              }
+            ];
+          };
+          boxKeys = box.config.users.users.agent.openssh.authorizedKeys.keys;
         in
         {
           inherit (self.packages.${system}) wett-mcp wett-mcp-hostd;
@@ -93,14 +125,24 @@
             exec_start=${pkgs.lib.escapeShellArg svc.ExecStart}
             config=$(echo "$exec_start" | sed -E 's/.*--config ([^ ]+) serve/\1/')
             ${pkgs.jq}/bin/jq -e '.localHostd.units == ["nginx.service"] and .notify.tokenFile == "notify-token"
-              and .media.sonarr.keyFile == "sonarr-key" and .sshKeyFile == "ssh-key"' "$config"
+              and .media.sonarr.keyFile == "sonarr-key" and .sshKeyFile == "ssh-key"
+              and .agentsHost == "box" and .hosts.box.keyFile == "ssh-key-box" and .hosts.remote == {"ssh": "wett-mcp-hostd@remote.example.test"}
+              and (.localHostd | has("agents") | not)' "$config"
             echo ${pkgs.lib.escapeShellArg (builtins.toJSON svc.LoadCredential)} | ${pkgs.jq}/bin/jq -e \
-              'sort == ["notify-token:/run/secrets/example-notify", "sonarr-key:/run/secrets/example-sonarr", "ssh-key:/run/secrets/example-key"]'
+              'sort == ["notify-token:/run/secrets/example-notify", "sonarr-key:/run/secrets/example-sonarr", "ssh-key-box:/run/secrets/example-box-key", "ssh-key:/run/secrets/example-key"]'
             echo ${
               pkgs.lib.escapeShellArg (
                 builtins.head eval.config.users.users.wett-mcp-hostd.openssh.authorizedKeys.keys
               )
             } | grep -q '^command="/nix/store/.*/bin/wett-mcp-hostd /nix/store/.*-wett-mcp-hostd.json",restrict ssh-ed25519 '
+            test ${toString (builtins.length boxKeys)} = 2
+            test ${pkgs.lib.boolToString box.config.users.users.agent.isNormalUser} = true
+            test ${pkgs.lib.boolToString (box.config.users.groups ? wett-mcp-hostd)} = false
+            key=${pkgs.lib.escapeShellArg (pkgs.lib.findFirst (k: pkgs.lib.hasInfix "AAAAconnector" k) "" boxKeys)}
+            hostd_config=$(echo "$key" | sed -E 's/^command="[^ ]+ ([^"]+)",restrict .*/\1/')
+            ${pkgs.jq}/bin/jq -e '.agents.cloneOwners == ["octocat"] and .agents.maxConcurrent == 3
+              and .agents.maxMinutes == 240 and .agents.envFiles.GH_TOKEN == "/run/gh-token"
+              and .agents.workRoot == "~/work" and .units == []' "$hostd_config"
             touch $out
           '';
         };

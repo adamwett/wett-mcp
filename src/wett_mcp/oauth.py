@@ -27,7 +27,8 @@ from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Re
 
 SCOPE_READ = "lab.read"
 SCOPE_WRITE = "lab.write"
-SCOPES = [SCOPE_READ, SCOPE_WRITE]
+SCOPE_AGENTS = "lab.agents"
+SCOPES = [SCOPE_READ, SCOPE_WRITE, SCOPE_AGENTS]
 CODE_TTL = 120
 FORM_TTL = 600
 CIMD_TTL = 3600
@@ -344,6 +345,9 @@ class AuthServer:
                 f"<input type=hidden name=form_token value='{token}'>"
                 "<p><label><input type=checkbox name=allow_write value=1> Also allow write tools "
                 f"(<code>{SCOPE_WRITE}</code>: Home Assistant actions, notifications)</label></p>"
+                "<p><label><input type=checkbox name=allow_agents value=1> Also allow dispatching coding "
+                f"agents (<code>{SCOPE_AGENTS}</code>: they run code on the agents host with its credentials; "
+                "every dispatch is pushed to your phone)</label></p>"
                 "<button name=decision value=approve>Approve</button>"
                 "<button name=decision value=deny>Deny</button></form>"
             )
@@ -353,7 +357,8 @@ class AuthServer:
             return _page("Expired", "<p>The approval form expired or was tampered with. Start again.</p>", 400)
         if src.get("decision") != "approve":
             return fail("access_denied", "denied by the user")
-        scopes = [SCOPE_READ] + ([SCOPE_WRITE] if src.get("allow_write") == "1" else [])
+        scopes = ([SCOPE_READ] + ([SCOPE_WRITE] if src.get("allow_write") == "1" else [])
+                  + ([SCOPE_AGENTS] if src.get("allow_agents") == "1" else []))
         code = secrets.token_urlsafe(32)
         self.store.q(
             "INSERT INTO codes(hash, client_id, redirect_uri, challenge, scopes, resource, email, expires) "

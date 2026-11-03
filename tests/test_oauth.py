@@ -40,32 +40,41 @@ def access_jwt(email=OWNER, aud=AUD, key=KEY, exp_in=300, iss=f"https://{TEAM}")
                       algorithm="RS256")
 
 
-def config(tmp_path, dcr=False):
+def config(tmp_path, dcr=False, agents=False):
     return {
+        **({"agentsHost": "box"} if agents else {}),
         "publicUrl": BASE,
         "stateDir": str(tmp_path),
         "access": {"teamDomain": TEAM, "aud": AUD, "allowEmails": [OWNER]},
         "cimd": {"allowedPrefixes": ["https://claude.ai/"]},
         "dcr": {"enable": dcr, "allowedRedirectUris": [CLAUDE_CB]},
-        "hosts": {},
+        "hosts": {"box": {"ssh": "agent@box.invalid"}} if agents else {},
         "notify": {"url": "http://notify.invalid/notify", "tokenFile": "/nonexistent"},
     }
 
 
 class Harness:
-    def __init__(self, tmp_path, dcr=False):
+    def __init__(self, tmp_path, dcr=False, agents=False):
         access = AccessVerifier(TEAM, AUD, [OWNER], get_key=lambda token: KEY.public_key())
-        self.app, self.auth, self.lab = build_app(config(tmp_path, dcr), access=access, fetch_cimd=CIMD.__getitem__)
+        self.app, self.auth, self.lab = build_app(config(tmp_path, dcr, agents), access=access,
+                                                  fetch_cimd=CIMD.__getitem__)
         self.notified = []
+        self.hostd_calls = []
 
-        async def fake_notify(message, title=None):
-            self.notified.append((message, title))
+        async def fake_notify(message, title=None, guardrail=False):
+            self.notified.append((message, title) if not guardrail else (message, title, "guardrail"))
+
+        async def fake_hostd(host, req):
+            self.hostd_calls.append((host, req))
+            return {"id": "0123abcd", "state": "running"} if req["verb"] != "agent_list" else {"jobs": []}
+
+        self.lab.hostd = fake_hostd
 
         self.lab.notify = fake_notify
         self.http = httpx.AsyncClient(transport=httpx.ASGITransport(app=self.app), base_url=BASE)
 
     async def authorize(self, client_id=CLIENT, redirect_uri=CLAUDE_CB, write=False, jwt_header=None,
-                        verifier=None):
+                        verifier=None, agents=False):
         verifier = verifier or secrets.token_urlsafe(48)
         challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
         params = {"response_type": "code", "client_id": client_id, "redirect_uri": redirect_uri,
@@ -79,6 +88,8 @@ class Harness:
         form = {**params, "form_token": form_token, "decision": "approve"}
         if write:
             form["allow_write"] = "1"
+        if agents:
+            form["allow_agents"] = "1"
         resp = await self.http.post("/oauth/authorize", data=form, headers=headers)
         assert resp.status_code == 302, resp.text
         loc = urllib.parse.urlsplit(resp.headers["location"])
@@ -95,8 +106,8 @@ class Harness:
         return await self.http.post("/oauth/token", data={
             "grant_type": "refresh_token", "refresh_token": refresh_token, "client_id": client_id})
 
-    async def tokens(self, write=False):
-        code, verifier = await self.authorize(write=write)
+    async def tokens(self, write=False, agents=False):
+        code, verifier = await self.authorize(write=write, agents=agents)
         resp = await self.exchange(code, verifier)
         assert resp.status_code == 200, resp.text
         return resp.json()
@@ -279,3 +290,73 @@ async def test_dcr_off_by_default_and_restricted_when_on(tmp_path):
     client_id = ok.json()["client_id"]
     code, verifier = await on.authorize(client_id=client_id)
     assert (await on.exchange(code, verifier, client_id=client_id)).status_code == 200
+
+
+async def test_agent_tools_need_agents_scope(tmp_path):
+    h = Harness(tmp_path, agents=True)
+    meta = (await h.http.get("/.well-known/oauth-authorization-server")).json()
+    assert "lab.agents" in meta["scopes_supported"]
+    page = await h.http.get("/oauth/authorize", params={
+        "response_type": "code", "client_id": CLIENT, "redirect_uri": CLAUDE_CB, "code_challenge": "x" * 43,
+        "code_challenge_method": "S256"}, headers={"cf-access-jwt-assertion": access_jwt()})
+    assert "name=allow_agents" in page.text and "name=allow_agents value=1 checked" not in page.text
+    async with h.running():
+        writer = await h.tokens(write=True)
+        names, result = await h.call(writer["access_token"], "agent_dispatch", {"repo": "proj", "prompt": "go"})
+        assert {"agent_dispatch", "agent_send", "agent_stop", "agent_list", "agent_read"} <= set(names)
+        assert result.isError and "lab.agents" in result.content[0].text
+        for tool, args in (("agent_send", {"id": "0123abcd", "message": "hi"}), ("agent_stop", {"id": "0123abcd"})):
+            _, result = await h.call(writer["access_token"], tool, args)
+            assert result.isError and "lab.agents" in result.content[0].text
+        assert h.hostd_calls == [] and h.notified == []
+
+        # Reading needs only lab.read.
+        _, result = await h.call(writer["access_token"], "agent_list", {})
+        assert not result.isError and h.hostd_calls == [("box", {"verb": "agent_list"})]
+
+        agent = await h.tokens(agents=True)
+        assert agent["scope"] == "lab.read lab.agents"
+        h.hostd_calls.clear()
+        _, result = await h.call(agent["access_token"], "agent_dispatch",
+                                 {"repo": "owner/proj", "prompt": "fix the build", "max_minutes": 30})
+        assert not result.isError, result.content[0].text
+        assert h.notified == [("dispatch in owner/proj: fix the build", "agent", "guardrail")]
+        assert h.hostd_calls == [("box", {"verb": "agent_dispatch", "repo": "owner/proj", "prompt": "fix the build",
+                                          "title": None, "max_minutes": 30})]
+        # lab.agents alone is not lab.write.
+        _, result = await h.call(agent["access_token"], "lab_notify", {"message": "hi"})
+        assert result.isError and "lab.write" in result.content[0].text
+
+
+@pytest.mark.parametrize("args", [
+    {"repo": "../etc", "prompt": "x"},
+    {"repo": "/etc", "prompt": "x"},
+    {"repo": "-rf", "prompt": "x"},
+    {"repo": "--upload-pack=evil", "prompt": "x"},
+    {"repo": "a/b/c", "prompt": "x"},
+    {"repo": "proj", "prompt": "   "},
+    {"repo": "proj", "prompt": "x" * 20001},
+    {"repo": "proj", "prompt": "x", "max_minutes": 0},
+])
+async def test_agent_dispatch_validated_before_notify_and_backend(tmp_path, args):
+    h = Harness(tmp_path, agents=True)
+    async with h.running():
+        agent = await h.tokens(agents=True)
+        _, result = await h.call(agent["access_token"], "agent_dispatch", args)
+        assert result.isError
+        assert h.hostd_calls == [] and h.notified == []
+
+
+async def test_agent_dispatch_refused_when_alert_fails(tmp_path):
+    h = Harness(tmp_path, agents=True)
+
+    async def broken_notify(message, title=None, guardrail=False):
+        from mcp.server.fastmcp.exceptions import ToolError
+        raise ToolError("relay down")
+
+    h.lab.notify = broken_notify
+    async with h.running():
+        agent = await h.tokens(agents=True)
+        _, result = await h.call(agent["access_token"], "agent_dispatch", {"repo": "proj", "prompt": "go"})
+        assert result.isError and "notification" in result.content[0].text
+        assert h.hostd_calls == []
