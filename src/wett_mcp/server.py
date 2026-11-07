@@ -24,7 +24,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 from starlette.routing import Route
 
-from . import hostd
+from . import hostd, printer
 from .oauth import SCOPE_AGENTS, SCOPE_READ, SCOPE_WRITE, AccessVerifier, AuthServer, Store, Verifier
 
 READ = ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False)
@@ -94,6 +94,7 @@ class Lab:
     def __init__(self, cfg: dict):
         self.cfg = cfg
         self.audit = Audit(Path(cfg["stateDir"]) / "audit.jsonl")
+        self.printer = printer.Printer(cfg["printer"]) if cfg.get("printer") else None
         self.hosts: dict[str, dict] = cfg.get("hosts", {})
         self._notify_times: list[float] = []
 
@@ -178,9 +179,9 @@ def build_mcp(cfg: dict, lab: Lab, auth: AuthServer) -> FastMCP:
     mcp = FastMCP(
         "wett-mcp",
         instructions="Read-mostly access to a homelab: host and service health, logs, metrics, "
-                     "Home Assistant, media queues, and phone notifications. Write tools need lab.write. "
-                     "agent_* tools dispatch and talk to headless coding agents (dispatch/send/stop need "
-                     "lab.agents); each turn ends with the agent's summary, which agent_read returns.",
+                     "Home Assistant, media queues, the printer, and phone notifications. Write tools need "
+                     "lab.write. agent_* tools dispatch and talk to headless coding agents (dispatch/send/stop "
+                     "need lab.agents); each turn ends with the agent's summary, which agent_read returns.",
         token_verifier=Verifier(auth),
         auth=AuthSettings(issuer_url=cfg["publicUrl"], resource_server_url=cfg["publicUrl"].rstrip("/") + "/mcp",
                           required_scopes=[SCOPE_READ]),
@@ -193,14 +194,17 @@ def build_mcp(cfg: dict, lab: Lab, auth: AuthServer) -> FastMCP:
         ),
     )
 
-    def tool(annotations: ToolAnnotations, scope: str = SCOPE_READ):
-        """Register a tool with scope check, audit and output clipping."""
+    def tool(annotations: ToolAnnotations, scope: str = SCOPE_READ, omit: tuple[str, ...] = ()):
+        """Register a tool with scope check, audit and output clipping. `omit`: arguments the audit log
+        records only by length (document contents)."""
 
         def deco(fn):
             async def run(ctx: Context, **kwargs):
                 token = _token(ctx)
                 scopes = token.scopes if token else []
-                entry = {"tool": fn.__name__, "args": kwargs, "client": getattr(token, "client_id", None),
+                args = {k: {"omitted_chars": len(v)} if k in omit and isinstance(v, str) else v
+                        for k, v in kwargs.items()}
+                entry = {"tool": fn.__name__, "args": args, "client": getattr(token, "client_id", None),
                          "family": getattr(token, "family", None)}
                 if scope not in scopes:
                     # The SDK checks scopes per endpoint, not per tool, so this can't be a 403
@@ -336,6 +340,33 @@ def build_mcp(cfg: dict, lab: Lab, auth: AuthServer) -> FastMCP:
             except ToolError:
                 pass
         return result
+
+    if lab.printer is not None:
+        @tool(READ)
+        async def printer_status() -> dict:
+            """The home printer over IPP: model, state (idle, processing, stopped) and reasons such as
+            media-empty or toner-low, ink/toner levels, paper loaded, duplex support, accepted formats, and
+            unfinished jobs (on the printer and, if jobs go through a CUPS queue, on the queue)."""
+            return await lab.printer.status()
+
+        @tool(WRITE, scope=SCOPE_WRITE, omit=("text", "document_base64"))
+        async def print_document(text: str | None = None, document_base64: str | None = None,
+                                 title: str | None = None, copies: int = 1, duplex: bool = False,
+                                 paper: str | None = None, font_size: int = 10) -> dict:
+            """Print on the home printer. Give exactly one of text (plain text, printed in Courier) or
+            document_base64 (a PDF, JPEG or PNG, base64-encoded). title: job name shown on the printer.
+            copies: 1 to the configured cap. duplex: two-sided, long-edge binding. paper: letter, legal, a4,
+            a5, a6, 4x6, 5x7 or a PWG media name (default: the printer's). font_size: text size in points,
+            8-36 (default 10; 18-24 is easy to read; lines wrap at spaces). Size, page and copy counts are
+            capped. Every job is logged and pushed to the owner's phone."""
+            job = await lab.printer.print(text, document_base64, title, copies, duplex, paper, font_size)
+            lab.audit.write(event="print_job", **job)
+            if cfg.get("notify"):
+                try:
+                    await lab.notify(f"{job['title']}: {job['pages']} page(s) x {copies}", "Printer")
+                except (ToolError, httpx.HTTPError, OSError):  # the job is already printing
+                    pass
+            return job
 
     agents_host = cfg.get("agentsHost")
     if agents_host:
