@@ -104,6 +104,17 @@ def test_text_to_pdf_pagination():
     assert b"/MediaBox [0 0 612.00 792.00]" in pdf
 
 
+def test_text_to_pdf_large_font_wraps_at_words():
+    # 24 pt on letter: 37 columns, 25 lines; leading spaces of a line are kept.
+    words = "Hello Herb, this is a note in large type that wraps at word boundaries."
+    pdf, pages = ipp.text_to_pdf("  " + words + "\n" * 30 + "end", 612, 792, size=24)
+    assert pages == 2
+    assert b"/F1 24 Tf 28.80 TL" in pdf
+    lines = [m.decode() for m in re.findall(rb"\((.*?)\) Tj", pdf)]
+    assert lines[:3] == ["  Hello Herb, this is a note in large", "type that wraps at word boundaries.", ""]
+    assert all(len(line) <= 37 for line in lines)
+
+
 def printer(fake, **cfg):
     p = ipp.Printer({"uri": DEVICE, "maxPages": 10, "maxCopies": 3, "maxBytes": 4096, **cfg},
                     transport=fake.transport)
@@ -151,6 +162,9 @@ def b64(data: bytes) -> str:
     ({"text": " \n"}, {}, "empty"),
     ({"text": "a", "copies": 0}, {}, "copies must be 1-3"),
     ({"text": "a", "copies": 4}, {}, "copies must be 1-3"),
+    ({"text": "a", "font_size": 7}, {}, "font_size must be 8-36"),
+    ({"text": "a", "font_size": 37}, {}, "font_size must be 8-36"),
+    ({"text": "a\n" * 200, "font_size": 36}, {}, "13 page(s) x 1 copies is over the 10-page limit"),
     ({"text": "a" * 5000}, {}, "larger than 4096"),
     ({"document_base64": b64(make_pdf(1) + b" " * 5000)}, {}, "larger than 4096"),
     ({"document_base64": "not base64!"}, {}, "not valid base64"),

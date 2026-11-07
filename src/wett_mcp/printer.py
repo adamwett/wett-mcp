@@ -7,6 +7,7 @@ import binascii
 import hashlib
 import re
 import struct
+import textwrap
 import urllib.parse
 import zlib
 from typing import Any
@@ -39,6 +40,7 @@ JOB_STATE = {3: "pending", 4: "pending-held", 5: "processing", 6: "processing-st
              8: "aborted", 9: "completed"}
 
 USER = "wett-mcp"
+FONT_MIN, FONT_MAX = 8, 36  # text printing, points
 PAPER = {"letter": "na_letter_8.5x11in", "legal": "na_legal_8.5x14in", "a4": "iso_a4_210x297mm",
          "a5": "iso_a5_148x210mm", "a6": "iso_a6_105x148mm", "4x6": "na_index-4x6_4x6in",
          "5x7": "na_5x7_5x7in"}
@@ -252,24 +254,23 @@ def _pdf_string(line: str) -> bytes:
     return b"(" + raw.replace(b"\\", b"\\\\").replace(b"(", b"\\(").replace(b")", b"\\)") + b")"
 
 
-def text_to_pdf(text: str, width: float, height: float) -> tuple[bytes, int]:
-    """Plain text as a PDF in 10 pt Courier with half-inch margins. Long lines wrap, tabs expand to 8
-    columns and form feeds start a new page. Characters outside Windows-1252 print as '?'."""
-    margin, size, leading, char_width = 36, 10, 12, 6.0
-    cols = max(20, int((width - 2 * margin) // char_width))
-    rows = max(5, int((height - 2 * margin) // leading))
+def text_to_pdf(text: str, width: float, height: float, size: int = 10) -> tuple[bytes, int]:
+    """Plain text as a PDF in `size` pt Courier with half-inch margins. Long lines wrap at spaces (or
+    mid-word if a word is longer than a line), tabs expand to 8 columns and form feeds start a new page.
+    Characters outside Windows-1252 print as '?'."""
+    margin, leading, char_width = 36, size * 1.2, size * 0.6
+    cols = max(1, int((width - 2 * margin) // char_width))
+    rows = max(1, int((height - 2 * margin) // leading))
     pages: list[list[str]] = []
     for chunk in text.replace("\r\n", "\n").replace("\r", "\n").split("\f"):
         pages.append([])
         for raw in chunk.split("\n"):
-            line = raw.expandtabs(8)
-            while True:
+            wrapped = textwrap.wrap(raw.expandtabs(8), cols, expand_tabs=False, replace_whitespace=False,
+                                    break_on_hyphens=False) or [""]
+            for line in wrapped:
                 if len(pages[-1]) == rows:
                     pages.append([])
-                pages[-1].append(line[:cols])
-                line = line[cols:]
-                if not line:
-                    break
+                pages[-1].append(line)
     # Drop blank trailing lines and the pages they leave empty.
     while pages and pages[-1] and not pages[-1][-1].strip():
         pages[-1].pop()
@@ -280,7 +281,7 @@ def text_to_pdf(text: str, width: float, height: float) -> tuple[bytes, int]:
                             b"/Encoding /WinAnsiEncoding >>"]
     kids = []
     for lines in pages:
-        content = (f"BT /F1 {size} Tf {leading} TL {margin} {height - margin - size:.2f} Td\n".encode()
+        content = (f"BT /F1 {size} Tf {leading:.2f} TL {margin} {height - margin - size:.2f} Td\n".encode()
                    + b"".join(_pdf_string(line) + b" Tj T*\n" for line in lines) + b"ET")
         objects.append(b"<< /Length %d >>\nstream\n" % len(content) + content + b"\nendstream")
         objects.append(f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {width:.2f} {height:.2f}] "
@@ -469,8 +470,10 @@ class Printer:
             raise ToolError(f"document is larger than {self.max_bytes} bytes")
 
     async def print(self, text: str | None, document_base64: str | None, title: str | None, copies: int,
-                    duplex: bool, paper: str | None) -> dict:
+                    duplex: bool, paper: str | None, font_size: int = 10) -> dict:
         self.check_request(text, document_base64, copies)
+        if not FONT_MIN <= font_size <= FONT_MAX:
+            raise ToolError(f"font_size must be {FONT_MIN}-{FONT_MAX}")
         media = None
         if paper:
             media = PAPER.get(paper.strip().lower(), paper.strip())
@@ -515,7 +518,7 @@ class Printer:
 
         if document is None:
             size = media_size_pt(media or _one(target, "media-default") or "") or media_size_pt(PAPER["letter"])
-            document, pages = text_to_pdf(text, *size)
+            document, pages = text_to_pdf(text, *size, size=font_size)
             self._check_pages(pages, copies)
 
         name = (title or "").strip()[:100] or "wett-mcp"

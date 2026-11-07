@@ -352,13 +352,14 @@ def build_mcp(cfg: dict, lab: Lab, auth: AuthServer) -> FastMCP:
         @tool(WRITE, scope=SCOPE_WRITE, omit=("text", "document_base64"))
         async def print_document(text: str | None = None, document_base64: str | None = None,
                                  title: str | None = None, copies: int = 1, duplex: bool = False,
-                                 paper: str | None = None) -> dict:
+                                 paper: str | None = None, font_size: int = 10) -> dict:
             """Print on the home printer. Give exactly one of text (plain text, printed in Courier) or
             document_base64 (a PDF, JPEG or PNG, base64-encoded). title: job name shown on the printer.
             copies: 1 to the configured cap. duplex: two-sided, long-edge binding. paper: letter, legal, a4,
-            a5, a6, 4x6, 5x7 or a PWG media name (default: the printer's). Size, page and copy counts are
+            a5, a6, 4x6, 5x7 or a PWG media name (default: the printer's). font_size: text size in points,
+            8-36 (default 10; 18-24 is easy to read; lines wrap at spaces). Size, page and copy counts are
             capped. Every job is logged and pushed to the owner's phone."""
-            job = await lab.printer.print(text, document_base64, title, copies, duplex, paper)
+            job = await lab.printer.print(text, document_base64, title, copies, duplex, paper, font_size)
             lab.audit.write(event="print_job", **job)
             if cfg.get("notify"):
                 try:
