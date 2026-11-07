@@ -77,6 +77,10 @@
                     url = "http://notify.example.test/notify";
                     tokenFile = "/run/secrets/example-notify";
                   };
+                  printer = {
+                    uri = "ipp://printer.example.test/ipp/print";
+                    cupsQueue = "canon";
+                  };
                   media.sonarr = {
                     url = "http://sonarr.example.test";
                     keyFile = "/run/secrets/example-sonarr";
@@ -127,7 +131,12 @@
             ${pkgs.jq}/bin/jq -e '.localHostd.units == ["nginx.service"] and .notify.tokenFile == "notify-token"
               and .media.sonarr.keyFile == "sonarr-key" and .sshKeyFile == "ssh-key"
               and .agentsHost == "box" and .hosts.box.keyFile == "ssh-key-box" and .hosts.remote == {"ssh": "wett-mcp-hostd@remote.example.test"}
-              and (.localHostd | has("agents") | not)' "$config"
+              and (.localHostd | has("agents") | not)
+              and .printer == {"uri": "ipp://printer.example.test/ipp/print", "jobUri": "ipp://localhost:631/printers/canon",
+                               "maxBytes": 10485760, "maxPages": 30, "maxCopies": 10}' "$config"
+            test ${pkgs.lib.boolToString eval.config.services.printing.enable} = true
+            echo ${pkgs.lib.escapeShellArg eval.config.systemd.services.wett-mcp-cups-queue.script} \
+              | grep -q 'lpadmin -p canon -v ipp://printer.example.test/ipp/print'
             echo ${pkgs.lib.escapeShellArg (builtins.toJSON svc.LoadCredential)} | ${pkgs.jq}/bin/jq -e \
               'sort == ["notify-token:/run/secrets/example-notify", "sonarr-key:/run/secrets/example-sonarr", "ssh-key-box:/run/secrets/example-box-key", "ssh-key:/run/secrets/example-key"]'
             echo ${

@@ -131,6 +131,20 @@ let
     media = lib.mapAttrs (name: m: m // lib.optionalAttrs (m ? keyFile) { keyFile = "${name}-key"; }) (
       lib.filterAttrs (_: m: m != null) cfg.media
     );
+    printer =
+      if cfg.printer == null then
+        null
+      else
+        {
+          inherit (cfg.printer)
+            uri
+            maxBytes
+            maxPages
+            maxCopies
+            ;
+          jobUri =
+            if cfg.printer.cupsQueue == null then null else "ipp://localhost:631/printers/${cfg.printer.cupsQueue}";
+        };
     # Agents never run in-process: they belong to a host whose hostd runs as the agents' user.
     localHostd = removeAttrs hostdSettings [ "agents" ];
   };
@@ -340,6 +354,51 @@ in
         default = null;
         description = "qBittorrent Web UI (must allow this host without login).";
       };
+    };
+
+    printer = mkOption {
+      type = types.nullOr (
+        types.submodule {
+          options = {
+            uri = mkOption {
+              type = types.str;
+              example = "ipp://Canon-printer.local:631/ipp/print";
+              description = ''
+                IPP URI (`ipp://` or `ipps://`) of the printer itself, for printer_status and, without
+                `cupsQueue`, for jobs. Use a DHCP-reserved address, or an mDNS `.local` name (which needs
+                `services.avahi.nssmdns4`).
+              '';
+            };
+            cupsQueue = mkOption {
+              type = types.nullOr (types.strMatching "[A-Za-z0-9_.-]+");
+              default = null;
+              example = "canon";
+              description = ''
+                Create a local CUPS driverless (IPP Everywhere) queue of this name for `uri` and send jobs
+                through it. CUPS converts PDF, text and images for printers that only take raster, and holds
+                jobs while the printer is busy or asleep. Enables `services.printing`.
+              '';
+            };
+            maxBytes = mkOption {
+              type = types.ints.positive;
+              default = 10 * 1024 * 1024;
+              description = "Largest document print_document accepts, bytes.";
+            };
+            maxPages = mkOption {
+              type = types.ints.positive;
+              default = 30;
+              description = "Most pages one job may print, copies included.";
+            };
+            maxCopies = mkOption {
+              type = types.ints.positive;
+              default = 10;
+              description = "Most copies per job.";
+            };
+          };
+        }
+      );
+      default = null;
+      description = "Network printer for printer_status (read) and print_document (`lab.write`).";
     };
 
     authFailureAlert = {
@@ -603,6 +662,33 @@ in
             "~@privileged"
           ];
         };
+      };
+    })
+
+    (lib.mkIf (cfg.enable && cfg.printer != null && cfg.printer.cupsQueue != null) {
+      services.printing.enable = true;
+      # Not hardware.printers.ensurePrinters: that runs lpadmin in cups.service's postStart, and
+      # `lpadmin -m everywhere` fails while the printer is off, taking CUPS down with it. This unit retries.
+      systemd.services.wett-mcp-cups-queue = {
+        description = "CUPS driverless queue for the wett-mcp printer";
+        wantedBy = [ "multi-user.target" ];
+        requires = [ "cups.service" ];
+        after = [
+          "cups.service"
+          "network-online.target"
+        ];
+        wants = [ "network-online.target" ];
+        path = [ config.services.printing.package ];
+        serviceConfig = {
+          Type = "oneshot";
+          RemainAfterExit = true;
+          Restart = "on-failure";
+          RestartSec = 60;
+        };
+        script = ''
+          lpadmin -p ${lib.escapeShellArg cfg.printer.cupsQueue} -v ${lib.escapeShellArg cfg.printer.uri} \
+            -m everywhere -E
+        '';
       };
     })
 

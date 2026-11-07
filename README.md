@@ -38,14 +38,17 @@ It is meant to sit behind a Cloudflare Tunnel.
 | `media_status` | read | Sonarr/Radarr queue and 7-day calendar, SABnzbd and qBittorrent queues, recent Jellyfin items. |
 | `lab_notify` | write | Phone notification through a bearer-token relay. Rate limited. |
 | `ha_call_service` | write | Allowlisted `domain.service` + entity globs, which must name entities explicitly. The built-in deny list always wins: locks, alarms, covers, valves, sirens, cameras, HA/OS administration, command/notify/MQTT services and others. Every call is mirrored as a notification. |
+| `printer_status` | read | The printer over IPP: model, state and reasons (`media-empty`, `toner-low`…), ink/toner levels, paper loaded, duplex, accepted formats, unfinished jobs on the printer and on the CUPS queue if there is one. |
+| `print_document(text?, document_base64?, title?, copies?, duplex?, paper?)` | write | Print plain text (rendered to PDF in Courier) or a base64 PDF, JPEG or PNG. Duplex is long-edge; `paper` takes `letter`, `legal`, `a4`, `a5`, `a6`, `4x6`, `5x7` or a PWG media name. Size, pages × copies and copies are capped. Every job is logged and mirrored as a notification. |
 | `agent_list` | read | Coding-agent jobs: id, title, repo, state (`running`, `idle`, `stopped`, `failed`), start, last activity, turns, queued messages, cost. |
 | `agent_read(id, since_turn?)` | read | Per finished turn: prompt, status (`ok`, `timed_out`, `failed`, `stopped`) and the agent's final message (redacted, ≤8000 chars), plus state, queued messages and an `omp --resume` command for taking the session over by hand. |
 | `agent_dispatch(repo, prompt, title?, max_minutes?)` | agents | Start a headless oh-my-pi (`omp`) coding agent. `repo` is a directory name in the work root, or `owner/name` from an allowlisted GitHub owner (cloned with `gh` if missing). |
 | `agent_send(id, message)` | agents | Follow-up: queued as the next turn while the agent runs; otherwise starts a run that resumes the session. |
 | `agent_stop(id)` | agents | Stop the current run and drop queued messages; the session stays resumable. |
 
-Every call is appended to `/var/lib/wett-mcp/audit.jsonl` with secrets redacted. More than 20 401s in 5 minutes
-triggers one notification.
+Every call is appended to `/var/lib/wett-mcp/audit.jsonl` with secrets redacted. Documents sent to `print_document`
+are logged only by length, plus a `print_job` entry per job (job id, format, pages, copies, sides, paper, bytes, a
+SHA-256 prefix). More than 20 401s in 5 minutes triggers one notification.
 
 ### Coding agents
 
@@ -70,6 +73,26 @@ Set `agentsHost` to a host whose hostd has `hostd.agents.enable`, running as the
   a note (`hostd.agents.systemNote`) saying it was dispatched remotely, must not push default branches unless
   told to, and must end each turn with a summary, which is what `agent_read` returns.
 - **Annotations.** The agents tools are `destructiveHint`; set dispatch and send to *always ask* in Claude.
+
+### Printer
+
+Set `printer.uri` to the printer's IPP endpoint (`ipp://<address>/ipp/print` on IPP Everywhere and AirPrint
+printers). Use a DHCP-reserved address, or the printer's mDNS `.local` name, which needs
+`services.avahi = { enable = true; nssmdns4 = true; }` on the server host.
+
+- **No drivers.** wett-mcp speaks IPP/1.1 itself (Get-Printer-Attributes, Get-Jobs, Print-Job). It checks the
+  format, duplex, paper and copies against what the printer advertises before sending anything.
+- **Raster-only printers.** Many inkjets accept only `image/pwg-raster`, `image/urf` and `image/jpeg`, not PDF.
+  Set `printer.cupsQueue = "canon"`: the module enables CUPS, creates a driverless (IPP Everywhere,
+  `lpadmin -m everywhere`) queue for `printer.uri`, retrying every minute until the printer answers, and sends jobs
+  through `ipp://localhost:631/printers/canon`. CUPS then converts PDF, text and images and holds jobs while the
+  printer is busy or asleep. `printer_status` still reads supplies and state from the printer itself.
+- **Without a queue**, a printer still on its previous job answers `server-error-busy`; Print-Job is retried for
+  30 s.
+- **Limits.** `maxBytes` (10 MiB), `maxPages` (30, copies included) and `maxCopies` (10). PDF pages are counted from
+  the page objects, including compressed object streams; a PDF whose pages can't be counted (encrypted) is
+  refused.
+- **TLS.** `ipps://` is encrypted but the certificate is not verified: printers use self-signed ones.
 
 ## NixOS
 
@@ -97,6 +120,7 @@ services.wettMcp = {
   haHost = "other";
   prometheus.url = "http://127.0.0.1:9090";
   notify = { url = "http://relay.example.lan/notify"; tokenFile = "/run/secrets/notify-token"; };
+  printer = { uri = "ipp://printer.example.lan/ipp/print"; cupsQueue = "canon"; };
   hostd.units = [ "nginx.service" "container@*.service" ];
 };
 
@@ -195,3 +219,8 @@ The tests run a real OAuth flow end to end:
 - The agent verbs against a fake `omp` on `PATH`: repo/id/argument validation (`..`, absolute paths, symlink
   escapes, owners outside the allowlist, flag-like repos and prompts), the concurrency cap, the inbox → resume
   loop, stop, timed-out and failed turns, and a runner killed without recording anything.
+- The IPP client against RFC 8010 wire-format fixtures and a fake printer: job attributes, checks that refuse a
+  job before it is sent (size, pages × copies, format, duplex, paper, copies, a printer not accepting jobs),
+  `server-error-busy` retries, supply levels from `marker-*` and `printer-supply`, and the audit log keeping
+  documents out.
+- PDF page counting through compressed object streams and incremental updates, and text → PDF pagination.

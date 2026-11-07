@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import re
+import json
 import secrets
 import time
 import urllib.parse
@@ -12,6 +13,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
+from conftest import DEVICE
 from wett_mcp.oauth import AccessVerifier
 from wett_mcp.server import build_app
 
@@ -40,9 +42,10 @@ def access_jwt(email=OWNER, aud=AUD, key=KEY, exp_in=300, iss=f"https://{TEAM}")
                       algorithm="RS256")
 
 
-def config(tmp_path, dcr=False, agents=False):
+def config(tmp_path, dcr=False, agents=False, printer=False):
     return {
         **({"agentsHost": "box"} if agents else {}),
+        **({"printer": {"uri": DEVICE}} if printer else {}),
         "publicUrl": BASE,
         "stateDir": str(tmp_path),
         "access": {"teamDomain": TEAM, "aud": AUD, "allowEmails": [OWNER]},
@@ -54,10 +57,12 @@ def config(tmp_path, dcr=False, agents=False):
 
 
 class Harness:
-    def __init__(self, tmp_path, dcr=False, agents=False):
+    def __init__(self, tmp_path, dcr=False, agents=False, printer=None):
         access = AccessVerifier(TEAM, AUD, [OWNER], get_key=lambda token: KEY.public_key())
-        self.app, self.auth, self.lab = build_app(config(tmp_path, dcr, agents), access=access,
-                                                  fetch_cimd=CIMD.__getitem__)
+        self.app, self.auth, self.lab = build_app(config(tmp_path, dcr, agents, printer is not None),
+                                                  access=access, fetch_cimd=CIMD.__getitem__)
+        if printer is not None:
+            self.lab.printer.transport = printer.transport
         self.notified = []
         self.hostd_calls = []
 
@@ -360,3 +365,32 @@ async def test_agent_dispatch_refused_when_alert_fails(tmp_path):
         _, result = await h.call(agent["access_token"], "agent_dispatch", {"repo": "proj", "prompt": "go"})
         assert result.isError and "notification" in result.content[0].text
         assert h.hostd_calls == []
+
+
+async def test_print_needs_write_scope_and_is_logged_without_contents(tmp_path, fake_printer):
+    h = Harness(tmp_path, printer=fake_printer)
+    secret_text = "quarterly numbers: do not log me"
+    async with h.running():
+        reader = await h.tokens()
+        names, result = await h.call(reader["access_token"], "printer_status", {})
+        assert {"printer_status", "print_document"} <= set(names)
+        assert not result.isError and '"Black Ink"' in result.content[0].text
+        _, result = await h.call(reader["access_token"], "print_document", {"text": secret_text})
+        assert result.isError and "lab.write" in result.content[0].text
+        assert fake_printer.print_jobs() == [] and h.notified == []
+
+        writer = await h.tokens(write=True)
+        _, result = await h.call(writer["access_token"], "print_document",
+                                 {"text": secret_text, "title": "Numbers", "copies": 2})
+        assert not result.isError, result.content[0].text
+        [(_, op, attrs, _)] = fake_printer.print_jobs()
+        assert op["job-name"] == ["Numbers"] and attrs == {"copies": [2]}
+        assert h.notified == [("Numbers: 1 page(s) x 2", "Printer")]
+
+    audit = (tmp_path / "audit.jsonl").read_text()
+    assert "do not log me" not in audit
+    entries = [json.loads(line) for line in audit.splitlines()]
+    [job] = [e for e in entries if e.get("event") == "print_job"]
+    assert job["job_id"] == 1 and job["pages"] == 1 and job["copies"] == 2 and len(job["sha256_prefix"]) == 16
+    [call] = [e for e in entries if e.get("tool") == "print_document" and e["ok"]]
+    assert call["args"]["text"] == {"omitted_chars": len(secret_text)} and call["args"]["title"] == "Numbers"

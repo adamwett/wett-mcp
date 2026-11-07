@@ -344,7 +344,7 @@ class AuthServer:
                 f"<form method=post action='{html.escape(self.base)}/oauth/authorize'>{hidden}"
                 f"<input type=hidden name=form_token value='{token}'>"
                 "<p><label><input type=checkbox name=allow_write value=1> Also allow write tools "
-                f"(<code>{SCOPE_WRITE}</code>: Home Assistant actions, notifications)</label></p>"
+                f"(<code>{SCOPE_WRITE}</code>: Home Assistant actions, notifications, printing)</label></p>"
                 "<p><label><input type=checkbox name=allow_agents value=1> Also allow dispatching coding "
                 f"agents (<code>{SCOPE_AGENTS}</code>: they run code on the agents host with its credentials; "
                 "every dispatch is pushed to your phone)</label></p>"
